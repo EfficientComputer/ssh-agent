@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+* **Breaking:** only treat key comments containing a `git@<host>:`, `https://<host>/` or `ssh://git@<host>[:<port>]/` repository URL, with a dot in `<host>`, as deploy keys. Comments such as `github.com:owner/repo` without `git@` are no longer recognized.
+* Map deploy keys for any Git host named in the key comment, including `ssh://` URLs with a port and repository paths with more than two segments (e.g. GitLab subgroups). Host names are lowercased, and web page paths such as `/tree/main` are ignored.
+* Update `@actions/core` to 1.10.0
+
+### Fixed
+
+* Fix a crash of the bundled action (since the fork's comment regex change) when a key comment does not contain a repository URL
+* Match the repository URL in the key comment only, not in the base64-encoded key
+
 ## v0.9.1 [2024-03-17]
 
 ### Fixed

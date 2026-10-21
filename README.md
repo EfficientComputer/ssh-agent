@@ -69,10 +69,10 @@ When using **Github deploy keys**, GitHub servers will accept the _first_ known 
 
 To support picking the right key in this use case, this action scans _key comments_ and will set up extra Git and SSH configuration to make things work.
 
-1. When creating the deploy key for a repository like `git@github.com:owner/repo.git` or `https://github.com/owner/repo`, put that URL into the key comment. (Hint: Try `ssh-keygen ... -C "git@github.com:owner/repo.git"`.)
+1. When creating the deploy key for a repository like `git@github.com:owner/repo.git` or `https://github.com/owner/repo`, put that URL into the key comment. (Hint: Try `ssh-keygen ... -C "git@github.com:owner/repo.git"`.) The URL can be of the form `git@<host>:<path>`, `https://<host>/<path>` or `ssh://git@<host>[:<port>]/<path>`, for any Git host whose name contains a dot, and `<path>` can have more than two segments (e.g. GitLab subgroups like `group/subgroup/repo`). The host name is matched in lowercase, and a web page path such as `/tree/main` after the repository is ignored.
 2. After keys have been added to the agent, this action will scan the key comments. 
-3. For key comments containing such URLs, a Git config setting is written that uses [`url.<base>.insteadof`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-urlltbasegtinsteadOf). It will redirect `git` requests to URLs starting with either `https://github.com/owner/repo` or `git@github.com:owner/repo` to a fake hostname/URL like `git@...some.hash...:owner/repo`.
-4. An SSH configuration section is generated that applies to the fake hostname. It will map the SSH connection back to `github.com`, while at the same time pointing SSH to a file containing the appropriate key's public part. That will make SSH use the right key when connecting to GitHub.com.
+3. For key comments containing such URLs, a Git config setting is written that uses [`url.<base>.insteadof`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-urlltbasegtinsteadOf). It will redirect `git` requests to URLs starting with `https://<host>/owner/repo`, `git@<host>:owner/repo` or `ssh://git@<host>/owner/repo` (plus `ssh://git@<host>:<port>/owner/repo` when the comment has a port) to a fake hostname/URL like `git@...some.hash...:owner/repo`.
+4. An SSH configuration section is generated that applies to the fake hostname. It will map the SSH connection back to the Git host (and port, when given), while at the same time pointing SSH to a file containing the appropriate key's public part. That will make SSH use the right key when connecting to the host. Settings from your own `Host <host>` section in `~/.ssh/config` (e.g. `User`) do not apply to the fake hostname.
 
 ## Action Inputs
 

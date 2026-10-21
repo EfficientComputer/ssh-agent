@@ -1,6 +1,15 @@
 on: [ push, pull_request ]
 
 jobs:
+    unit_tests:
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v6
+            -   uses: actions/setup-node@v7
+                with:
+                    node-version: 24
+            -   run: npm test
+
     deployment_keys_demo:
         strategy:
             fail-fast: false
@@ -44,3 +53,26 @@ jobs:
                     git clone git@github.com:mpdude/test-2.git test-2-git
                     git clone ssh://git@github.com/mpdude/test-2.git test-2-git-ssh
 
+    other_host_demo:
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v6
+            -   name: Generate a key for a repository on another host
+                id: key
+                run: |
+                    ssh-keygen -q -t ed25519 -N '' -C 'ssh://git@git.example.com:2222/group/sub/repo.git' -f "$RUNNER_TEMP/key"
+                    { echo 'private-key<<EOF'; cat "$RUNNER_TEMP/key"; echo EOF; } >> "$GITHUB_OUTPUT"
+            -   name: Setup key
+                uses: ./
+                with:
+                    ssh-private-key: ${{ steps.key.outputs.private-key }}
+            -   name: Check the git and ssh config
+                run: |
+                    git config --global --get-regexp '^url\.git@key-[0-9a-f]{64}\.git\.example\.com:group/sub/repo\.insteadof$' > rewrites
+                    cat rewrites
+                    grep -F ' https://git.example.com/group/sub/repo' rewrites
+                    grep -F ' git@git.example.com:group/sub/repo' rewrites
+                    grep -F ' ssh://git@git.example.com/group/sub/repo' rewrites
+                    grep -F ' ssh://git@git.example.com:2222/group/sub/repo' rewrites
+                    grep -E '^ +HostName git\.example\.com$' ~/.ssh/config
+                    grep -E '^ +Port 2222$' ~/.ssh/config

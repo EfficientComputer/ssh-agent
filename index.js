@@ -3,6 +3,7 @@ const child_process = require('child_process');
 const fs = require('fs');
 const crypto = require('crypto');
 const { homePath, sshAgentCmd, sshAddCmd, gitCmd } = require('./paths.js');
+const { parseKeyComment, repositoryUrls } = require('./deploykeys.js');
 
 try {
     const privateKey = core.getInput('ssh-private-key');
@@ -46,32 +47,37 @@ try {
     console.log('Configuring deployment key(s)');
 
     child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).forEach(function(key) {
-        const parts = key.match(/\bgithub\.com[:/]([_.a-z0-9-]+\/[_.a-z0-9-]+)/i);
+        // `ssh-add -L` prints "<type> <base64 key> <comment>"; only the comment names the repository
+        const comment = key.split(' ').slice(2).join(' ');
+        const repository = parseKeyComment(comment);
 
-        if (!parts) {
+        if (!repository) {
             if (logPublicKey) {
-              console.log(`Comment for (public) key '${key}' does not match GitHub URL pattern. Not treating it as a GitHub deploy key.`);
+              console.log(`Comment for (public) key '${key}' does not contain a repository URL. Not treating it as a deploy key.`);
             }
             return;
         }
 
         const sha256 = crypto.createHash('sha256').update(key).digest('hex');
-        const ownerAndRepo = parts[1].replace(/\.git$/, '');
+        const alias = `key-${sha256}.${repository.host}`;
 
         fs.writeFileSync(`${homeSsh}/key-${sha256}`, key + "\n", { mode: '600' });
 
-        child_process.execSync(`${gitCmd} config --global --replace-all url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "https://github.com/${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "git@github.com:${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "ssh://git@github.com/${ownerAndRepo}"`);
+        const section = `url.git@${alias}:${repository.repoPath}`;
 
-        const sshConfig = `\nHost key-${sha256}.github.com\n`
-                              + `    HostName github.com\n`
+        repositoryUrls(repository).forEach(function(url, index) {
+            child_process.execFileSync(gitCmd, ['config', '--global', index == 0 ? '--replace-all' : '--add', `${section}.insteadOf`, url]);
+        });
+
+        const sshConfig = `\nHost ${alias}\n`
+                              + `    HostName ${repository.host}\n`
+                              + (repository.port ? `    Port ${repository.port}\n` : '')
                               + `    IdentityFile ${homeSsh}/key-${sha256}\n`
                               + `    IdentitiesOnly yes\n`;
 
         fs.appendFileSync(`${homeSsh}/config`, sshConfig);
 
-        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/key-${sha256}' for GitHub repository ${ownerAndRepo}`);
+        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/key-${sha256}' for ${repository.host} repository ${repository.repoPath}`);
     });
 
 } catch (error) {
