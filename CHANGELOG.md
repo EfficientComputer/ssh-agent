@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+* **Breaking:** set the deploy-key `insteadOf` mappings through the `GIT_CONFIG_*` environment variables instead of the global Git config, so that they end with the job. Deploy keys now need Git 2.31 or later, and the mappings only reach processes that inherit the job environment; see "Known Issues and Limitations" in the README. For Docker builds, the README shows how to write them to a `.gitconfig` file.
 * **Breaking:** only treat key comments containing a `git@<host>:`, `https://<host>/` or `ssh://git@<host>[:<port>]/` repository URL, with a dot in `<host>`, as deploy keys. Comments such as `github.com:owner/repo` without `git@` are no longer recognized.
 * Map deploy keys for any Git host named in the key comment, including `ssh://` URLs with a port and repository paths with more than two segments (e.g. GitLab subgroups). Host names are lowercased, and web page paths such as `/tree/main` are ignored.
+* Remove all deploy-key mappings from the global Git config before adding the action's own, e.g. stale ones left by other jobs sharing `$HOME`
+* Do not append an SSH `Host` section that `~/.ssh/config` already contains
 * Update `@actions/core` to 1.10.0
 
 ### Fixed

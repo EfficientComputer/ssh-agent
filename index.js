@@ -1,9 +1,17 @@
 const core = require('@actions/core');
 const child_process = require('child_process');
 const fs = require('fs');
-const crypto = require('crypto');
 const { homePath, sshAgentCmd, sshAddCmd, gitCmd } = require('./paths.js');
-const { parseKeyComment, repositoryUrls } = require('./deploykeys.js');
+const {
+    parseKeyComment,
+    deployKeyNames,
+    rewriteEntries,
+    withoutDeployKeyRewrites,
+    checkGitVersion,
+    removeGlobalDeployKeyRewrites,
+    parseConfigEnv,
+    formatConfigEnv,
+} = require('./deploykeys.js');
 
 try {
     const privateKey = core.getInput('ssh-private-key');
@@ -44,41 +52,62 @@ try {
 
     child_process.execFileSync(sshAddCmd, ['-l'], { stdio: 'inherit' });
 
+    try {
+        removeGlobalDeployKeyRewrites(gitCmd);
+    } catch (error) {
+        // The job's own rewrites don't depend on the global git config, so this is not fatal
+        if (error.code == 'ENOENT') {
+            console.log(`Not checking the global git config for deploy-key rewrites: '${error.path}' not found`);
+        } else {
+            core.warning(`Could not remove deploy-key rewrites from the global git config: ${error.message}`);
+        }
+    }
+
     console.log('Configuring deployment key(s)');
 
-    child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).forEach(function(key) {
-        // `ssh-add -L` prints "<type> <base64 key> <comment>"; only the comment names the repository
-        const comment = key.split(' ').slice(2).join(' ');
-        const repository = parseKeyComment(comment);
+    // `ssh-add -L` prints "<type> <base64 key> <comment>"; only the comment names the repository
+    const deployKeys = child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).flatMap(function(publicKey) {
+        const repository = parseKeyComment(publicKey.split(' ').slice(2).join(' '));
 
-        if (!repository) {
-            if (logPublicKey) {
-              console.log(`Comment for (public) key '${key}' does not contain a repository URL. Not treating it as a deploy key.`);
-            }
-            return;
+        if (!repository && logPublicKey) {
+            console.log(`Comment for (public) key '${publicKey}' does not contain a repository URL. Not treating it as a deploy key.`);
         }
 
-        const sha256 = crypto.createHash('sha256').update(key).digest('hex');
-        const alias = `key-${sha256}.${repository.host}`;
+        return repository ? [{ publicKey, repository }] : [];
+    });
 
-        fs.writeFileSync(`${homeSsh}/key-${sha256}`, key + "\n", { mode: '600' });
+    if (deployKeys.length > 0) {
+        checkGitVersion(gitCmd);
+    }
 
-        const section = `url.git@${alias}:${repository.repoPath}`;
+    // The rewrites go into the job's environment rather than the global git config, so that they
+    // end with the job. Deploy-key rewrites from earlier invocations in the job are dropped: their
+    // keys are in an ssh-agent that is no longer used.
+    let gitConfigEntries = withoutDeployKeyRewrites(parseConfigEnv(process.env));
+    const sshConfigFile = `${homeSsh}/config`;
 
-        repositoryUrls(repository).forEach(function(url, index) {
-            child_process.execFileSync(gitCmd, ['config', '--global', index == 0 ? '--replace-all' : '--add', `${section}.insteadOf`, url]);
-        });
+    deployKeys.forEach(function({ publicKey, repository }) {
+        const { keyFile, alias } = deployKeyNames(publicKey, repository.host);
 
+        fs.writeFileSync(`${homeSsh}/${keyFile}`, publicKey + "\n", { mode: '600' });
+
+        gitConfigEntries = gitConfigEntries.concat(rewriteEntries(alias, repository));
+
+        // The Host block only depends on the key and host, so one from an earlier job can be reused
         const sshConfig = `\nHost ${alias}\n`
                               + `    HostName ${repository.host}\n`
                               + (repository.port ? `    Port ${repository.port}\n` : '')
-                              + `    IdentityFile ${homeSsh}/key-${sha256}\n`
+                              + `    IdentityFile ${homeSsh}/${keyFile}\n`
                               + `    IdentitiesOnly yes\n`;
 
-        fs.appendFileSync(`${homeSsh}/config`, sshConfig);
+        if (!(fs.existsSync(sshConfigFile) && fs.readFileSync(sshConfigFile, 'utf8').includes(sshConfig))) {
+            fs.appendFileSync(sshConfigFile, sshConfig);
+        }
 
-        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/key-${sha256}' for ${repository.host} repository ${repository.repoPath}`);
+        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/${keyFile}' for ${repository.host} repository ${repository.repoPath}`);
     });
+
+    Object.entries(formatConfigEnv(gitConfigEntries)).forEach(([name, value]) => core.exportVariable(name, value));
 
 } catch (error) {
 
