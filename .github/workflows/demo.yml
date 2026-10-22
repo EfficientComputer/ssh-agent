@@ -16,15 +16,20 @@ jobs:
             matrix:
                 os: [ ubuntu-latest, macOS-latest, windows-latest ]
         runs-on: ${{ matrix.os }}
+        # The deploy keys for the mpdude/test-* repositories are only available where the secrets are set
+        env:
+            HAS_MPDUDE_SECRETS: ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY != '' }}
         steps:
             -   uses: actions/checkout@v6
             -   name: Setup key
+                if: env.HAS_MPDUDE_SECRETS == 'true'
                 uses: ./
                 with:
                     ssh-private-key: |
                         ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY }}
                         ${{ secrets.MPDUDE_TEST_2_DEPLOY_KEY }}
-            -   run: |
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: |
                     git clone https://github.com/mpdude/test-1.git test-1-http
                     git clone git@github.com:mpdude/test-1.git test-1-git
                     git clone ssh://git@github.com/mpdude/test-1.git test-1-git-ssh
@@ -36,16 +41,21 @@ jobs:
         runs-on: ubuntu-latest
         container:
             image: ubuntu:latest
+        env:
+            HAS_MPDUDE_SECRETS: ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY != '' }}
         steps:
             -   uses: actions/checkout@v6
-            -   run: apt update && apt install -y openssh-client git
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: apt update && apt install -y openssh-client git
             -   name: Setup key
+                if: env.HAS_MPDUDE_SECRETS == 'true'
                 uses: ./
                 with:
                     ssh-private-key: |
                         ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY }}
                         ${{ secrets.MPDUDE_TEST_2_DEPLOY_KEY }}
-            -   run: |
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: |
                     git clone https://github.com/mpdude/test-1.git test-1-http
                     git clone git@github.com:mpdude/test-1.git test-1-git
                     git clone ssh://git@github.com/mpdude/test-1.git test-1-git-ssh
