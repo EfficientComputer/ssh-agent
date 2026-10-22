@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+* **Breaking:** set the deploy-key `insteadOf` mappings through the `GIT_CONFIG_*` environment variables instead of the global Git config, so that they end with the job. Deploy keys now need Git 2.31 or later, and the mappings only reach processes that inherit the job environment; see "Known Issues and Limitations" in the README. For Docker builds, the README shows how to write them to a `.gitconfig` file.
+* **Breaking:** only treat key comments containing a `git@<host>:`, `https://<host>/` or `ssh://git@<host>[:<port>]/` repository URL, with a dot in `<host>`, as deploy keys. Comments such as `github.com:owner/repo` without `git@` are no longer recognized.
+* Map deploy keys for any Git host named in the key comment, including `ssh://` URLs with a port and repository paths with more than two segments (e.g. GitLab subgroups). Host names are lowercased, and web page paths such as `/tree/main` are ignored.
+* Remove all deploy-key mappings from the global Git config before adding the action's own, e.g. stale ones left by other jobs sharing `$HOME`
+* Do not append an SSH `Host` section that `~/.ssh/config` already contains
+* Update `@actions/core` to 1.10.0
+
+### Fixed
+
+* Fix a crash of the bundled action (since the fork's comment regex change) when a key comment does not contain a repository URL
+* Match the repository URL in the key comment only, not in the base64-encoded key
+
+## v0.9.1 [2024-03-17]
+
+### Fixed
+
+* Fix path used to execute ssh-agent in cleanup.js to respect custom paths set by input (#235)
+
+## v0.9.0 [2024-02-06]
+
+### Changed
+
+* Update all versions of `actions/checkout` to v4 (#199)
+* Update to Node 20 (#201)
+
+## v0.8.0 [2023-03-24]
+
+### Changed
+
+* No longer writing GitHub's SSH host keys to `known_hosts` (#171)
+* Update to actions/checkout@v3 (#143)
+* Allow the user to override the commands for git, ssh-agent, and ssh-add (#154)
+
 ## v0.7.0 [2022-10-19]
 
 ### Added

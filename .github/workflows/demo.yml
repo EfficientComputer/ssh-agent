@@ -1,21 +1,35 @@
 on: [ push, pull_request ]
 
 jobs:
+    unit_tests:
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v6
+            -   uses: actions/setup-node@v7
+                with:
+                    node-version: 24
+            -   run: npm test
+
     deployment_keys_demo:
         strategy:
             fail-fast: false
             matrix:
                 os: [ ubuntu-latest, macOS-latest, windows-latest ]
         runs-on: ${{ matrix.os }}
+        # The deploy keys for the mpdude/test-* repositories are only available where the secrets are set
+        env:
+            HAS_MPDUDE_SECRETS: ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY != '' }}
         steps:
-            -   uses: actions/checkout@v4
+            -   uses: actions/checkout@v6
             -   name: Setup key
+                if: env.HAS_MPDUDE_SECRETS == 'true'
                 uses: ./
                 with:
                     ssh-private-key: |
                         ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY }}
                         ${{ secrets.MPDUDE_TEST_2_DEPLOY_KEY }}
-            -   run: |
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: |
                     git clone https://github.com/mpdude/test-1.git test-1-http
                     git clone git@github.com:mpdude/test-1.git test-1-git
                     git clone ssh://git@github.com/mpdude/test-1.git test-1-git-ssh
@@ -27,16 +41,21 @@ jobs:
         runs-on: ubuntu-latest
         container:
             image: ubuntu:latest
+        env:
+            HAS_MPDUDE_SECRETS: ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY != '' }}
         steps:
-            -   uses: actions/checkout@v4
-            -   run: apt update && apt install -y openssh-client git
+            -   uses: actions/checkout@v6
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: apt update && apt install -y openssh-client git
             -   name: Setup key
+                if: env.HAS_MPDUDE_SECRETS == 'true'
                 uses: ./
                 with:
                     ssh-private-key: |
                         ${{ secrets.MPDUDE_TEST_1_DEPLOY_KEY }}
                         ${{ secrets.MPDUDE_TEST_2_DEPLOY_KEY }}
-            -   run: |
+            -   if: env.HAS_MPDUDE_SECRETS == 'true'
+                run: |
                     git clone https://github.com/mpdude/test-1.git test-1-http
                     git clone git@github.com:mpdude/test-1.git test-1-git
                     git clone ssh://git@github.com/mpdude/test-1.git test-1-git-ssh
@@ -44,3 +63,91 @@ jobs:
                     git clone git@github.com:mpdude/test-2.git test-2-git
                     git clone ssh://git@github.com/mpdude/test-2.git test-2-git-ssh
 
+    generated_keys_demo:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ ubuntu-latest, macOS-latest, windows-latest ]
+        runs-on: ${{ matrix.os }}
+        defaults:
+            run:
+                shell: bash
+        steps:
+            -   uses: actions/checkout@v6
+            -   name: Generate keys
+                id: keys
+                run: |
+                    ssh-keygen -q -t ed25519 -N '' -C 'git@github.com:owner/repo.git' -f "$RUNNER_TEMP/github"
+                    ssh-keygen -q -t ed25519 -N '' -C 'ssh://git@git.example.com:2222/group/sub/repo.git' -f "$RUNNER_TEMP/other"
+                    ssh-keygen -q -t ed25519 -N '' -C 'ci@runner' -f "$RUNNER_TEMP/plain"
+                    ssh-keygen -q -t ed25519 -N '' -C 'git@github.com:owner/repo.git' -f "$RUNNER_TEMP/github2"
+                    { echo 'first<<EOF'; cat "$RUNNER_TEMP/github" "$RUNNER_TEMP/other" "$RUNNER_TEMP/plain"; echo EOF; } >> "$GITHUB_OUTPUT"
+                    { echo 'second<<EOF'; cat "$RUNNER_TEMP/github2"; echo EOF; } >> "$GITHUB_OUTPUT"
+            -   name: Set a git config entry in the environment
+                run: |
+                    { echo GIT_CONFIG_COUNT=1; echo GIT_CONFIG_KEY_0=user.name; echo GIT_CONFIG_VALUE_0=demo; } >> "$GITHUB_ENV"
+            -   name: Plant deploy-key rewrites left by other jobs and an unrelated rewrite
+                run: |
+                    git config --global url."git@key-0000000000000000000000000000000000000000000000000000000000000000.github.com:owner/repo".insteadOf "https://github.com/owner/repo"
+                    git config --global url."git@key-1111111111111111111111111111111111111111111111111111111111111111.github.com:owner/unkeyed".insteadOf "https://github.com/owner/unkeyed"
+                    git config --global url."https://example.com/".insteadOf "example:"
+            -   name: Setup keys
+                uses: ./
+                with:
+                    ssh-private-key: ${{ steps.keys.outputs.first }}
+            -   name: Check the git and ssh config
+                id: first
+                run: |
+                    git config --show-scope --get-regexp '^(url\.|user\.)'
+                    # No deploy-key rewrites in the global config (exit status 1: nothing found)
+                    status=0; git config --global --get-regexp '^url\.git@key-' || status=$?
+                    test "$status" = 1
+                    test "$(git config --global --get url.https://example.com/.insteadOf)" = example:
+                    test "$(git config --get user.name)" = demo
+                    test "$(git ls-remote --get-url https://github.com/owner/unkeyed)" = https://github.com/owner/unkeyed
+
+                    github=$(git ls-remote --get-url git@github.com:owner/repo)
+                    [[ $github =~ ^git@key-[0-9a-f]{64}\.github\.com:owner/repo$ ]]
+                    test "$(git ls-remote --get-url https://github.com/owner/repo)" = "$github"
+                    test "$(git ls-remote --get-url ssh://git@github.com/owner/repo)" = "$github"
+
+                    other=$(git ls-remote --get-url ssh://git@git.example.com:2222/group/sub/repo)
+                    [[ $other =~ ^git@(key-[0-9a-f]{64}\.git\.example\.com):group/sub/repo$ ]]
+                    test "$(git ls-remote --get-url git@git.example.com:group/sub/repo)" = "$other"
+                    ssh -G "${BASH_REMATCH[1]}" | grep -Fx 'hostname git.example.com'
+                    ssh -G "${BASH_REMATCH[1]}" | grep -Fx 'port 2222'
+
+                    # One Host block per deploy key, none for the key without a repository URL
+                    test "$(grep -c '^Host key-' ~/.ssh/config)" = 2
+                    echo "github=$github" >> "$GITHUB_OUTPUT"
+            -   name: Collect the git config for a Docker build as in the README
+                run: |
+                    mkdir root-config
+                    cp ~/.gitconfig root-config/ 2>/dev/null || true
+                    for ((i = 0; i < ${GIT_CONFIG_COUNT:-0}; i++)); do
+                      key=GIT_CONFIG_KEY_$i value=GIT_CONFIG_VALUE_$i
+                      git config --file root-config/.gitconfig --add "${!key}" "${!value}"
+                    done
+                    # The SSH config and the deploy keys' public parts (not e.g. the agent socket)
+                    mkdir root-config/.ssh
+                    cp ~/.ssh/config ~/.ssh/key-* root-config/.ssh/
+
+                    cat root-config/.gitconfig
+                    test "$(git config --file root-config/.gitconfig --get user.name)" = demo
+                    test "$(git config --file root-config/.gitconfig --get url.https://example.com/.insteadOf)" = example:
+                    test "$(git config --file root-config/.gitconfig --get-regexp '^url\.git@key-' | wc -l)" -eq 7
+                    test "$(grep -c '^Host key-' root-config/.ssh/config)" = 2
+                    test "$(ls root-config/.ssh/key-* | wc -l)" -eq 2
+            -   name: Setup a second key for the same repository
+                uses: ./
+                with:
+                    ssh-private-key: ${{ steps.keys.outputs.second }}
+            -   name: Check that the second key replaced the first invocation's rewrites
+                env:
+                    FIRST: ${{ steps.first.outputs.github }}
+                run: |
+                    github=$(git ls-remote --get-url git@github.com:owner/repo)
+                    [[ $github =~ ^git@key-[0-9a-f]{64}\.github\.com:owner/repo$ ]]
+                    test "$github" != "$FIRST"
+                    test "$(git ls-remote --get-url ssh://git@git.example.com:2222/group/sub/repo)" = ssh://git@git.example.com:2222/group/sub/repo
+                    test "$(git config --get user.name)" = demo
