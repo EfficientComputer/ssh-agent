@@ -9,7 +9,7 @@ It should work in all GitHub Actions virtual environments, including container-b
 
 Windows and Docker support is, however, somewhat new. Since we have little feedback from the field, things might not run so smooth for you as we'd hope. If Windows and/or Docker-based workflows work well for you, leave a :+1: at https://github.com/webfactory/ssh-agent/pull/17.
 
-Also, using multiple GitHub deployment keys is supported; keys are mapped to repositories by using SSH key comments (see below).
+Also, using multiple deploy keys is supported; keys are mapped to repositories by using SSH key comments (see below).
 
 ## Why?
 
@@ -69,10 +69,12 @@ When using **Github deploy keys**, GitHub servers will accept the _first_ known 
 
 To support picking the right key in this use case, this action scans _key comments_ and will set up extra Git and SSH configuration to make things work.
 
-1. When creating the deploy key for a repository like `git@github.com:owner/repo.git` or `https://github.com/owner/repo`, put that URL into the key comment. (Hint: Try `ssh-keygen ... -C "git@github.com:owner/repo.git"`.)
+1. When creating the deploy key for a repository like `git@github.com:owner/repo.git` or `https://github.com/owner/repo`, put that URL into the key comment. (Hint: Try `ssh-keygen ... -C "git@github.com:owner/repo.git"`.) The URL can be of the form `git@<host>:<path>`, `https://<host>/<path>` or `ssh://git@<host>[:<port>]/<path>`, for any Git host whose name contains a dot, and `<path>` can have more than two segments (e.g. GitLab subgroups like `group/subgroup/repo`). The host name is matched in lowercase, and a web page path such as `/tree/main` after the repository is ignored.
 2. After keys have been added to the agent, this action will scan the key comments. 
-3. For key comments containing such URLs, a Git config setting is written that uses [`url.<base>.insteadof`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-urlltbasegtinsteadOf). It will redirect `git` requests to URLs starting with either `https://github.com/owner/repo` or `git@github.com:owner/repo` to a fake hostname/URL like `git@...some.hash...:owner/repo`.
-4. An SSH configuration section is generated that applies to the fake hostname. It will map the SSH connection back to `github.com`, while at the same time pointing SSH to a file containing the appropriate key's public part. That will make SSH use the right key when connecting to GitHub.com.
+3. For key comments containing such URLs, a Git config setting is added to the job's environment (through the `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` variables) that uses [`url.<base>.insteadof`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-urlltbasegtinsteadOf). It will redirect `git` requests to URLs starting with `https://<host>/owner/repo`, `git@<host>:owner/repo` or `ssh://git@<host>/owner/repo` (plus `ssh://git@<host>:<port>/owner/repo` when the comment has a port) to a fake hostname/URL like `git@...some.hash...:owner/repo`. As environment variables, these settings end with the job. Settings from an earlier invocation of the action in the same job are replaced, since its keys are in an ssh-agent that is no longer used.
+4. An SSH configuration section is generated that applies to the fake hostname. It will map the SSH connection back to the Git host (and port, when given), while at the same time pointing SSH to a file containing the appropriate key's public part. That will make SSH use the right key when connecting to the host. Settings from your own `Host <host>` section in `~/.ssh/config` (e.g. `User`) do not apply to the fake hostname.
+5. Before adding its settings, the action removes all deploy-key settings of this kind from the global Git config (`~/.gitconfig`). Other jobs leave them there on self-hosted runners that share `$HOME` between jobs (e.g. older versions of this action, or `webfactory/ssh-agent`), and when a setting there matches a URL as long as one in the environment, Git uses the one in `~/.gitconfig`. Other settings in `~/.gitconfig` are kept. If the removal fails, the action logs a warning and continues.
+6. The generated SSH configuration sections and key files are written to the `.ssh` directory of the user's home directory from the password database, which is where SSH looks for them. In container jobs, that directory is inside the container and ends with the job; on other runners, the sections and files stay and are reused by later jobs with the same key.
 
 ## Action Inputs
 
@@ -90,12 +92,24 @@ The following inputs can be used to control the action's behavior:
 The action exports the `SSH_AUTH_SOCK` and `SSH_AGENT_PID` environment variables through the Github Actions core module.
 The `$SSH_AUTH_SOCK` is used by several applications like git or rsync to connect to the SSH authentication agent.
 The `$SSH_AGENT_PID` contains the process id of the agent. This is used to kill the agent in post job action.
+The action also exports `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` with the Git settings that select the deploy keys (see above), keeping any other entries already set in these variables.
 
 ## Known Issues and Limitations
 
 ### Works for the Current Job Only
 
 Since each job [runs in a fresh instance](https://help.github.com/en/articles/about-github-actions#job) of the virtual environment, the SSH key will only be available in the job where this action has been referenced. You can, of course, add the action in multiple jobs or even workflows. All instances can use the same `SSH_PRIVATE_KEY` secret.
+
+### Deploy Keys Need Git 2.31 and the Job Environment
+
+The deploy-key settings are passed to Git through the `GIT_CONFIG_*` environment variables. When deploy keys are used, the action therefore fails with Git versions before 2.31, which ignore these variables. The settings also do not reach:
+
+* tools that read Git config files but not these variables, e.g. those based on libgit2 or JGit (such as Cargo without `net.git-fetch-with-cli`);
+* commands that run with a cleaned environment, e.g. through `sudo` or `env -i`;
+* Docker builds and containers started by a step; see [Using Multiple Deploy Keys Inside Docker Builds](#using-multiple-deploy-keys-inside-docker-builds) for passing them on;
+* steps that set `GIT_CONFIG_COUNT` in their own `env:`, which replaces the exported value for that step.
+
+Docker container actions (`uses: docker://...` or an action with a `Dockerfile`) receive the variables but not the SSH configuration, so cloning a deploy-key repository in them fails, including over `https://`.
 
 ### SSH Private Key Format
 
@@ -130,7 +144,7 @@ Make sure not to miss the next section, though.
 
 ### Using Multiple Deploy Keys Inside Docker Builds
 
-When you pass the SSH agent socket to the Docker build environment _and_ want to use multiple GitHub deploy keys, you need to copy the Git and SSH configuration files to the build environment as well. This is necessary _in addition to_ forwarding the SSH agent socket into the build process. The config files are required so that Git can pick the right one from your deployment keys.
+When you pass the SSH agent socket to the Docker build environment _and_ want to use multiple deploy keys, you need to copy the Git settings and the SSH configuration file to the build environment as well. This is necessary _in addition to_ forwarding the SSH agent socket into the build process. The config files are required so that Git can pick the right one from your deployment keys.
 
 This requires an additional step in the workflow file **after** the `ssh-agent` step and **before** the Docker build step.  You also need two additional lines in the `Dockerfile` to actually copy the configs.
 
@@ -147,7 +161,15 @@ Workflow:
       - name: Collect Git and SSH config files in a directory that is part of the Docker build context
         run: |
           mkdir root-config
-          cp -r ~/.gitconfig  ~/.ssh root-config/
+          cp ~/.gitconfig root-config/ 2>/dev/null || true
+          # The deploy-key settings are in the GIT_CONFIG_* environment variables; add them to the file
+          for ((i = 0; i < ${GIT_CONFIG_COUNT:-0}; i++)); do
+            key=GIT_CONFIG_KEY_$i value=GIT_CONFIG_VALUE_$i
+            git config --file root-config/.gitconfig --add "${!key}" "${!value}"
+          done
+          # The SSH config and the deploy keys' public parts (not e.g. the agent socket)
+          mkdir root-config/.ssh
+          cp ~/.ssh/config ~/.ssh/key-* root-config/.ssh/
   
       - name: Docker build 
         # build-push-action | docker [compose] build | etc.

@@ -337,20 +337,21 @@ exports.prepareKeyValueMessage = prepareKeyValueMessage;
 const core = __webpack_require__(470);
 const child_process = __webpack_require__(129);
 const fs = __webpack_require__(747);
-const crypto = __webpack_require__(417);
-const { homePath, sshAgentCmdDefault, sshAddCmdDefault, gitCmdDefault } = __webpack_require__(972);
+const { homePath, sshAgentCmd, sshAddCmd, gitCmd } = __webpack_require__(972);
+const {
+    parseKeyComment,
+    deployKeyNames,
+    rewriteEntries,
+    withoutDeployKeyRewrites,
+    checkGitVersion,
+    removeGlobalDeployKeyRewrites,
+    parseConfigEnv,
+    formatConfigEnv,
+} = __webpack_require__(505);
 
 try {
     const privateKey = core.getInput('ssh-private-key');
     const logPublicKey = core.getBooleanInput('log-public-key', {default: true});
-
-    const sshAgentCmdInput = core.getInput('ssh-agent-cmd');
-    const sshAddCmdInput = core.getInput('ssh-add-cmd');
-    const gitCmdInput = core.getInput('git-cmd');
-
-    const sshAgentCmd = sshAgentCmdInput ? sshAgentCmdInput : sshAgentCmdDefault;
-    const sshAddCmd = sshAddCmdInput ? sshAddCmdInput : sshAddCmdDefault;
-    const gitCmd = gitCmdInput ? gitCmdInput : gitCmdDefault;
 
     if (!privateKey) {
         core.setFailed("The ssh-private-key argument is empty. Maybe the secret has not been configured, or you are using a wrong secret name in your workflow file.");
@@ -387,37 +388,62 @@ try {
 
     child_process.execFileSync(sshAddCmd, ['-l'], { stdio: 'inherit' });
 
+    try {
+        removeGlobalDeployKeyRewrites(gitCmd);
+    } catch (error) {
+        // The job's own rewrites don't depend on the global git config, so this is not fatal
+        if (error.code == 'ENOENT') {
+            console.log(`Not checking the global git config for deploy-key rewrites: '${error.path}' not found`);
+        } else {
+            core.warning(`Could not remove deploy-key rewrites from the global git config: ${error.message}`);
+        }
+    }
+
     console.log('Configuring deployment key(s)');
 
-    child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).forEach(function(key) {
-        const parts = key.match(/\b([_.a-z0-9-]+)[:/]([_.a-z0-9-]+\/[_.a-z0-9-]+)/i);
+    // `ssh-add -L` prints "<type> <base64 key> <comment>"; only the comment names the repository
+    const deployKeys = child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).flatMap(function(publicKey) {
+        const repository = parseKeyComment(publicKey.split(' ').slice(2).join(' '));
 
-        if (!parts) {
-            if (logPublicKey) {
-            console.log(`Comment for (public) key '${key}' does not match ${url} pattern. Not treating it as a deploy key.`);
-            }
-            return;
+        if (!repository && logPublicKey) {
+            console.log(`Comment for (public) key '${publicKey}' does not contain a repository URL. Not treating it as a deploy key.`);
         }
 
-        const sha256 = crypto.createHash('sha256').update(key).digest('hex');
-        const url = parts[1]
-        const ownerAndRepo = parts[2].replace(/\.git$/, '');
-
-        fs.writeFileSync(`${homeSsh}/key-${sha256}`, key + "\n", { mode: '600' });
-
-        child_process.execSync(`${gitCmd} config --global --replace-all url."git@key-${sha256}.${url}:${ownerAndRepo}".insteadOf "https://${url}/${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.${url}:${ownerAndRepo}".insteadOf "git@${url}:${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.${url}:${ownerAndRepo}".insteadOf "ssh://git@${url}/${ownerAndRepo}"`);
-
-        const sshConfig = `\nHost key-${sha256}.${url}\n`
-                            + `    HostName ${url}\n`
-                            + `    IdentityFile ${homeSsh}/key-${sha256}\n`
-                            + `    IdentitiesOnly yes\n`;
-
-        fs.appendFileSync(`${homeSsh}/config`, sshConfig);
-
-        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/key-${sha256}' for ${url} repository ${ownerAndRepo}`);
+        return repository ? [{ publicKey, repository }] : [];
     });
+
+    if (deployKeys.length > 0) {
+        checkGitVersion(gitCmd);
+    }
+
+    // The rewrites go into the job's environment rather than the global git config, so that they
+    // end with the job. Deploy-key rewrites from earlier invocations in the job are dropped: their
+    // keys are in an ssh-agent that is no longer used.
+    let gitConfigEntries = withoutDeployKeyRewrites(parseConfigEnv(process.env));
+    const sshConfigFile = `${homeSsh}/config`;
+
+    deployKeys.forEach(function({ publicKey, repository }) {
+        const { keyFile, alias } = deployKeyNames(publicKey, repository.host);
+
+        fs.writeFileSync(`${homeSsh}/${keyFile}`, publicKey + "\n", { mode: '600' });
+
+        gitConfigEntries = gitConfigEntries.concat(rewriteEntries(alias, repository));
+
+        // The Host block only depends on the key and host, so one from an earlier job can be reused
+        const sshConfig = `\nHost ${alias}\n`
+                              + `    HostName ${repository.host}\n`
+                              + (repository.port ? `    Port ${repository.port}\n` : '')
+                              + `    IdentityFile ${homeSsh}/${keyFile}\n`
+                              + `    IdentitiesOnly yes\n`;
+
+        if (!(fs.existsSync(sshConfigFile) && fs.readFileSync(sshConfigFile, 'utf8').includes(sshConfig))) {
+            fs.appendFileSync(sshConfigFile, sshConfig);
+        }
+
+        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/${keyFile}' for ${repository.host} repository ${repository.repoPath}`);
+    });
+
+    Object.entries(formatConfigEnv(gitConfigEntries)).forEach(([name, value]) => core.exportVariable(name, value));
 
 } catch (error) {
 
@@ -2099,6 +2125,175 @@ exports.default = _default;
 
 /***/ }),
 
+/***/ 505:
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const { execFileSync } = __webpack_require__(129);
+const crypto = __webpack_require__(417);
+
+// Names of the `url.<base>.insteadOf` keys of deploy-key rewrites, as written by this action and
+// webfactory/ssh-agent. git prints these names with `url` and `insteadof` in lowercase, so the
+// pattern's source also works as a case-sensitive git regex.
+const deployKeyInsteadOfPattern = /^url\.git@key-[0-9a-f]{64}\..*\.insteadof$/i;
+
+// git 2.31 is the first version that reads config from GIT_CONFIG_COUNT/KEY_<n>/VALUE_<n>
+const minGitVersion = [2, 31];
+
+const hostPattern = '[a-z0-9-]+(?:\\.[a-z0-9-]+)+';
+
+// Repository URL in a key comment: `git@<host>:<path>`, `https://<host>/<path>` or
+// `ssh://git@<host>[:<port>]/<path>`, where <host> contains a dot and <path> has at least two
+// segments (e.g. owner/repo or group/subgroup/repo)
+const repositoryUrlPattern = new RegExp(
+    `\\b(?:git@(${hostPattern}):|https://(${hostPattern})/|ssh://git@(${hostPattern})(?::(\\d+))?/)`
+    + '([_.a-z0-9-]+(?:/[_.a-z0-9-]+)+)',
+    'i'
+);
+
+// Path suffixes of web pages within a repository, e.g. https://github.com/owner/repo/tree/main
+// or https://gitlab.com/group/repo/-/tree/main
+const webPageSuffix = /\/(?:-|tree|blob|commits?|pulls?|issues|merge_requests)(?:\/.*)?$/;
+
+// Returns { host, port, repoPath } for the repository named in a key comment, or null
+function parseKeyComment(comment) {
+    const parts = comment.match(repositoryUrlPattern);
+
+    if (!parts) {
+        return null;
+    }
+
+    return {
+        host: (parts[1] || parts[2] || parts[3]).toLowerCase(),
+        port: parts[4],
+        repoPath: parts[5].replace(webPageSuffix, '').replace(/\.git$/, ''),
+    };
+}
+
+// Names derived from a public key (an `ssh-add -L` line): the file holding it in ~/.ssh and the
+// ssh Host alias that git connects to for the repository on `host`
+function deployKeyNames(publicKey, host) {
+    const keyFile = `key-${crypto.createHash('sha256').update(publicKey).digest('hex')}`;
+    return { keyFile, alias: `${keyFile}.${host}` };
+}
+
+// URLs of the repository that git rewrites to the deploy key's ssh Host alias
+function repositoryUrls({ host, port, repoPath }) {
+    const urls = [`https://${host}/${repoPath}`, `git@${host}:${repoPath}`, `ssh://git@${host}/${repoPath}`];
+
+    if (port) {
+        urls.push(`ssh://git@${host}:${port}/${repoPath}`);
+    }
+
+    return urls;
+}
+
+// Git config entries that rewrite the repository's URLs to the ssh Host alias `alias`
+function rewriteEntries(alias, repository) {
+    const key = `url.git@${alias}:${repository.repoPath}.insteadOf`;
+    return repositoryUrls(repository).map(url => ({ key, value: url }));
+}
+
+function withoutDeployKeyRewrites(entries) {
+    return entries.filter(entry => !deployKeyInsteadOfPattern.test(entry.key));
+}
+
+// Whether `git --version` output is at least minGitVersion
+function supportsConfigEnv(versionOutput) {
+    const [major, minor] = (versionOutput.match(/(\d+)\.(\d+)/) || []).slice(1).map(Number);
+    return major > minGitVersion[0] || (major === minGitVersion[0] && minor >= minGitVersion[1]);
+}
+
+function checkGitVersion(gitCmd) {
+    const version = execFileSync(gitCmd, ['--version']).toString().trim();
+
+    if (!supportsConfigEnv(version)) {
+        throw new Error(`Deploy keys need git ${minGitVersion.join('.')} or later, found '${version}'`);
+    }
+}
+
+function globalGitConfig(gitCmd, args) {
+    // LC_ALL=C keeps git's error messages in English
+    return execFileSync(gitCmd, ['config', '--global', ...args], { stdio: 'pipe', env: { ...process.env, LC_ALL: 'C' } }).toString();
+}
+
+// Lists the sections of the deploy-key rewrites in the global git config
+function listGlobalDeployKeySections(gitCmd) {
+    let output;
+
+    try {
+        output = globalGitConfig(gitCmd, ['--name-only', '--get-regexp', deployKeyInsteadOfPattern.source]);
+    } catch (error) {
+        // `git config --get-regexp` exits with status 1 when nothing matches
+        if (error.status === 1) {
+            return [];
+        }
+        throw error;
+    }
+
+    const sections = output.split(/\r?\n/).filter(Boolean).map(name => name.replace(/\.insteadof$/, ''));
+
+    return [...new Set(sections)];
+}
+
+function removeSections(gitCmd, sections) {
+    sections.forEach(function(section) {
+        try {
+            globalGitConfig(gitCmd, ['--remove-section', section]);
+            console.log(`Removed git config section ${section}`);
+        } catch (error) {
+            // Another git process can remove the section first
+            if (!String(error.stderr).includes('no such section')) {
+                throw error;
+            }
+        }
+    });
+}
+
+// Removes all deploy-key rewrites from the global git config. Other jobs leave them there when
+// $HOME is shared between jobs, pointing to ssh Host aliases that may no longer exist, and git
+// prefers them over equally long rewrites set in the environment.
+function removeGlobalDeployKeyRewrites(gitCmd) {
+    removeSections(gitCmd, listGlobalDeployKeySections(gitCmd));
+}
+
+// Reads the git config entries set through GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n> and
+// GIT_CONFIG_VALUE_<n> as { key, value } pairs
+function parseConfigEnv(env) {
+    const count = parseInt(env.GIT_CONFIG_COUNT || '0', 10);
+
+    return Array.from({ length: count }, (_, i) => ({ key: env[`GIT_CONFIG_KEY_${i}`], value: env[`GIT_CONFIG_VALUE_${i}`] }));
+}
+
+function formatConfigEnv(entries) {
+    const env = { GIT_CONFIG_COUNT: String(entries.length) };
+
+    entries.forEach(function({ key, value }, i) {
+        env[`GIT_CONFIG_KEY_${i}`] = key;
+        env[`GIT_CONFIG_VALUE_${i}`] = value;
+    });
+
+    return env;
+}
+
+module.exports = {
+    deployKeyInsteadOfPattern,
+    parseKeyComment,
+    deployKeyNames,
+    repositoryUrls,
+    rewriteEntries,
+    withoutDeployKeyRewrites,
+    supportsConfigEnv,
+    checkGitVersion,
+    listGlobalDeployKeySections,
+    removeSections,
+    removeGlobalDeployKeyRewrites,
+    parseConfigEnv,
+    formatConfigEnv,
+};
+
+
+/***/ }),
+
 /***/ 554:
 /***/ (function(__unusedmodule, exports) {
 
@@ -2697,8 +2892,8 @@ class OidcClient {
             const res = yield httpclient
                 .getJson(id_token_url)
                 .catch(error => {
-                throw new Error(`Failed to get ID Token. \n
-        Error Code : ${error.statusCode}\n
+                throw new Error(`Failed to get ID Token. \n 
+        Error Code : ${error.statusCode}\n 
         Error Message: ${error.result.message}`);
             });
             const id_token = (_a = res.result) === null || _a === void 0 ? void 0 : _a.value;
@@ -2919,10 +3114,12 @@ exports.default = _default;
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
 const os = __webpack_require__(87);
+const core = __webpack_require__(470);
 
-module.exports = (process.env['OS'] != 'Windows_NT') ? {
-    // Use getent() system call, since this is what ssh does; makes a difference in Docker-based
-    // Action runs, where $HOME is different from the pwent
+const defaults = (process.env['OS'] != 'Windows_NT') ? {
+    // We use os.userInfo() rather than os.homedir(), since it uses the getpwuid() system call to get the user's home directory (see https://nodejs.org/api/os.html#osuserinfooptions).
+    // This mimics the way openssh derives the home directory for locating config files (see https://github.com/openssh/openssh-portable/blob/826483d51a9fee60703298bbf839d9ce37943474/ssh.c#L710);
+    // Makes a difference in Docker-based Action runs, when $HOME is different from what getpwuid() returns (which is based on the entry in /etc/passwd)
     homePath: os.userInfo().homedir,
     sshAgentCmdDefault: 'ssh-agent',
     sshAddCmdDefault: 'ssh-add',
@@ -2933,6 +3130,17 @@ module.exports = (process.env['OS'] != 'Windows_NT') ? {
     sshAgentCmdDefault: 'c://progra~1//git//usr//bin//ssh-agent.exe',
     sshAddCmdDefault: 'c://progra~1//git//usr//bin//ssh-add.exe',
     gitCmdDefault: 'c://progra~1//git//bin//git.exe'
+};
+
+const sshAgentCmdInput = core.getInput('ssh-agent-cmd');
+const sshAddCmdInput = core.getInput('ssh-add-cmd');
+const gitCmdInput = core.getInput('git-cmd');
+
+module.exports = {
+    homePath: defaults.homePath,
+    sshAgentCmd: sshAgentCmdInput !== '' ? sshAgentCmdInput : defaults.sshAgentCmdDefault,
+    sshAddCmd: sshAddCmdInput !== '' ? sshAddCmdInput : defaults.sshAddCmdDefault,
+    gitCmd: gitCmdInput !== '' ? gitCmdInput : defaults.gitCmdDefault,
 };
 
 

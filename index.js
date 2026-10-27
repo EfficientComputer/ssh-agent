@@ -1,20 +1,21 @@
 const core = require('@actions/core');
 const child_process = require('child_process');
 const fs = require('fs');
-const crypto = require('crypto');
-const { homePath, sshAgentCmdDefault, sshAddCmdDefault, gitCmdDefault } = require('./paths.js');
+const { homePath, sshAgentCmd, sshAddCmd, gitCmd } = require('./paths.js');
+const {
+    parseKeyComment,
+    deployKeyNames,
+    rewriteEntries,
+    withoutDeployKeyRewrites,
+    checkGitVersion,
+    removeGlobalDeployKeyRewrites,
+    parseConfigEnv,
+    formatConfigEnv,
+} = require('./deploykeys.js');
 
 try {
     const privateKey = core.getInput('ssh-private-key');
     const logPublicKey = core.getBooleanInput('log-public-key', {default: true});
-
-    const sshAgentCmdInput = core.getInput('ssh-agent-cmd');
-    const sshAddCmdInput = core.getInput('ssh-add-cmd');
-    const gitCmdInput = core.getInput('git-cmd');
-
-    const sshAgentCmd = sshAgentCmdInput ? sshAgentCmdInput : sshAgentCmdDefault;
-    const sshAddCmd = sshAddCmdInput ? sshAddCmdInput : sshAddCmdDefault;
-    const gitCmd = gitCmdInput ? gitCmdInput : gitCmdDefault;
 
     if (!privateKey) {
         core.setFailed("The ssh-private-key argument is empty. Maybe the secret has not been configured, or you are using a wrong secret name in your workflow file.");
@@ -51,36 +52,62 @@ try {
 
     child_process.execFileSync(sshAddCmd, ['-l'], { stdio: 'inherit' });
 
+    try {
+        removeGlobalDeployKeyRewrites(gitCmd);
+    } catch (error) {
+        // The job's own rewrites don't depend on the global git config, so this is not fatal
+        if (error.code == 'ENOENT') {
+            console.log(`Not checking the global git config for deploy-key rewrites: '${error.path}' not found`);
+        } else {
+            core.warning(`Could not remove deploy-key rewrites from the global git config: ${error.message}`);
+        }
+    }
+
     console.log('Configuring deployment key(s)');
 
-    child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).forEach(function(key) {
-        const parts = key.match(/\bgithub\.com[:/]([_.a-z0-9-]+\/[_.a-z0-9-]+)/i);
+    // `ssh-add -L` prints "<type> <base64 key> <comment>"; only the comment names the repository
+    const deployKeys = child_process.execFileSync(sshAddCmd, ['-L']).toString().trim().split(/\r?\n/).flatMap(function(publicKey) {
+        const repository = parseKeyComment(publicKey.split(' ').slice(2).join(' '));
 
-        if (!parts) {
-            if (logPublicKey) {
-              console.log(`Comment for (public) key '${key}' does not match GitHub URL pattern. Not treating it as a GitHub deploy key.`);
-            }
-            return;
+        if (!repository && logPublicKey) {
+            console.log(`Comment for (public) key '${publicKey}' does not contain a repository URL. Not treating it as a deploy key.`);
         }
 
-        const sha256 = crypto.createHash('sha256').update(key).digest('hex');
-        const ownerAndRepo = parts[1].replace(/\.git$/, '');
+        return repository ? [{ publicKey, repository }] : [];
+    });
 
-        fs.writeFileSync(`${homeSsh}/key-${sha256}`, key + "\n", { mode: '600' });
+    if (deployKeys.length > 0) {
+        checkGitVersion(gitCmd);
+    }
 
-        child_process.execSync(`${gitCmd} config --global --replace-all url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "https://github.com/${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "git@github.com:${ownerAndRepo}"`);
-        child_process.execSync(`${gitCmd} config --global --add url."git@key-${sha256}.github.com:${ownerAndRepo}".insteadOf "ssh://git@github.com/${ownerAndRepo}"`);
+    // The rewrites go into the job's environment rather than the global git config, so that they
+    // end with the job. Deploy-key rewrites from earlier invocations in the job are dropped: their
+    // keys are in an ssh-agent that is no longer used.
+    let gitConfigEntries = withoutDeployKeyRewrites(parseConfigEnv(process.env));
+    const sshConfigFile = `${homeSsh}/config`;
 
-        const sshConfig = `\nHost key-${sha256}.github.com\n`
-                              + `    HostName github.com\n`
-                              + `    IdentityFile ${homeSsh}/key-${sha256}\n`
+    deployKeys.forEach(function({ publicKey, repository }) {
+        const { keyFile, alias } = deployKeyNames(publicKey, repository.host);
+
+        fs.writeFileSync(`${homeSsh}/${keyFile}`, publicKey + "\n", { mode: '600' });
+
+        gitConfigEntries = gitConfigEntries.concat(rewriteEntries(alias, repository));
+
+        // The Host block only depends on the key and host, so one from an earlier job can be reused
+        const sshConfig = `\nHost ${alias}\n`
+                              + `    HostName ${repository.host}\n`
+                              + (repository.port ? `    Port ${repository.port}\n` : '')
+                              + `    IdentityFile ${homeSsh}/${keyFile}\n`
                               + `    IdentitiesOnly yes\n`;
 
-        fs.appendFileSync(`${homeSsh}/config`, sshConfig);
+        if (!(fs.existsSync(sshConfigFile) && fs.readFileSync(sshConfigFile, 'utf8').includes(sshConfig))) {
+            fs.appendFileSync(sshConfigFile, sshConfig);
+        }
 
-        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/key-${sha256}' for GitHub repository ${ownerAndRepo}`);
+        console.log(`Added deploy-key mapping: Use identity '${homeSsh}/${keyFile}' for ${repository.host} repository ${repository.repoPath}`);
     });
+
+    Object.entries(formatConfigEnv(gitConfigEntries)).forEach(([name, value]) => core.exportVariable(name, value));
 
 } catch (error) {
 
